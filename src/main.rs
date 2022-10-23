@@ -37,7 +37,7 @@ impl From<Error> for StatusCode {
     }
 }
 
-async fn redirect() -> Result<Json<Link<'static>>, StatusCode> {
+async fn redirect() -> Result<Json<Link>, StatusCode> {
     let route = Link {
         path: LinkPath::parse("test"),
     };
@@ -68,15 +68,14 @@ enum LiteralPathSegment<'a> {
 }
 
 impl<'a> LiteralPath<'a> {
-    fn parse(s: &'a str) -> Self {
-        let mut segments = parse_segments(
-            s,
-            |s| LiteralPathSegment::Separator,
-            |s| LiteralPathSegment::Literal(s),
-        );
-        // reverse so we can pop from the "front"
-        segments.reverse();
-        Self { segments }
+    fn parse(s: &'a str) -> LiteralPath<'a> {
+        Self {
+            segments: parse_segments(
+                s,
+                |s| LiteralPathSegment::Separator,
+                |s| LiteralPathSegment::Literal(s),
+            ),
+        }
     }
 
     fn separator_count(&self) -> usize {
@@ -85,17 +84,6 @@ impl<'a> LiteralPath<'a> {
             .filter(|s| matches!(s, LiteralPathSegment::Separator))
             .count()
     }
-
-    fn pop(&mut self) -> Option<LiteralPathSegment> {
-        self.segments.pop()
-    }
-
-    //     fn get(&self, index: usize) -> Cow<'a, LiteralPathSegment> {
-    //         self.segments
-    //             .get(index)
-    //             .map(Cow::Borrowed)
-    //             .unwrap_or_else(|| Cow::Owned(LiteralPathSegment::Empty))
-    //     }
 }
 
 fn parse_segments<'a, S>(
@@ -129,8 +117,8 @@ fn parse_segments<'a, S>(
     segments
 }
 
-impl<'a> LinkPath<'a> {
-    fn parse(s: &'a str) -> Self {
+impl LinkPath {
+    fn parse(s: &str) -> Self {
         Self {
             segments: parse_segments(
                 s,
@@ -147,22 +135,27 @@ impl<'a> LinkPath<'a> {
             .count()
     }
 
-    fn matches<'b: 'a>(&self, path: &'b str) -> SegmentMatchResult<HashMap<String, &'b str>> {
-        let mut path: LiteralPath<'b> = LiteralPath::parse(path);
-        // TODO exit early if a segment doesn't match
-        let (matches, extract) = self.segments.iter().enumerate().fold(
-            (true, HashMap::new()),
-            move |(matches, mut extract), (index, s)| {
-                let p = path.pop().unwrap_or(LiteralPathSegment::Empty);
-                eprintln!("{:?} vs {:?}", p, s);
-                let result: SegmentMatchResult<&'b str> = s.matches(p);
+    fn matches<'b>(&self, path: &'b str) -> SegmentMatchResult<HashMap<String, &'b str>> {
+        let mut literal_path: LiteralPath<'b> = LiteralPath::parse(path);
+        let (matches, extract) = self
+            .segments
+            .iter()
+            .zip(
+                literal_path
+                    .segments
+                    .into_iter()
+                    // if the link path is longer, match aganst Empty
+                    .chain(std::iter::repeat(LiteralPathSegment::Empty)),
+            )
+            .fold((true, HashMap::new()), |(matches, mut extract), (s, p)| {
+                let result = s.matches(p);
                 let matches = if matches { result.is_match } else { matches };
                 if let Some(extract_value) = result.extract {
                     extract.insert("todo".to_string(), extract_value);
                 }
                 (matches, extract)
-            },
-        );
+            });
+
         SegmentMatchResult {
             is_match: matches,
             extract: Some(extract),
@@ -171,22 +164,22 @@ impl<'a> LinkPath<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-enum LinkPathSegment<'a> {
-    Literal(&'a str),
-    Wildcard(&'a str),
+enum LinkPathSegment {
+    Literal(String),
+    Wildcard(String),
     Separator,
 }
 
-impl<'a> LinkPathSegment<'a> {
-    fn parse(s: &'a str) -> Self {
+impl LinkPathSegment {
+    fn parse(s: &str) -> Self {
         if s == "/" {
             Self::Separator
         } else if s.starts_with("%") && s.ends_with("%") {
             // TODO what if the string is "%%"
             let name = &s[1..(s.len() - 1)];
-            Self::Wildcard(name)
+            Self::Wildcard(name.to_string())
         } else {
-            Self::Literal(s)
+            Self::Literal(s.to_string())
         }
     }
 
@@ -203,6 +196,14 @@ impl<'a> LinkPathSegment<'a> {
             (Self::Wildcard(name), LiteralPathSegment::Literal(value)) => SegmentMatchResult {
                 is_match: true,
                 extract: Some(value),
+            },
+            (Self::Wildcard(name), LiteralPathSegment::Empty) => SegmentMatchResult {
+                is_match: true,
+                extract: None,
+            },
+            (Self::Wildcard(name), LiteralPathSegment::Separator) => SegmentMatchResult {
+                is_match: true,
+                extract: None,
             },
             _ => SegmentMatchResult {
                 is_match: false,
@@ -248,7 +249,7 @@ mod test {
     #[test]
     fn it_parses_wildcards() {
         let path = LinkPathSegment::parse("%test%");
-        assert_eq!(path, LinkPathSegment::Wildcard("test"));
+        assert_eq!(path, LinkPathSegment::Wildcard("test".to_string()));
     }
 
     #[test]
@@ -258,9 +259,9 @@ mod test {
             path,
             LinkPath {
                 segments: vec![
-                    LinkPathSegment::Literal("test"),
+                    LinkPathSegment::Literal("test".to_string()),
                     LinkPathSegment::Separator,
-                    LinkPathSegment::Wildcard("test")
+                    LinkPathSegment::Wildcard("test".to_string())
                 ]
             }
         );
@@ -275,7 +276,7 @@ mod test {
     #[test]
     fn it_parses_literals() {
         let path = LinkPathSegment::parse("test");
-        assert_eq!(path, LinkPathSegment::Literal("test"));
+        assert_eq!(path, LinkPathSegment::Literal("test".to_string()));
     }
 
     #[test]
@@ -284,7 +285,10 @@ mod test {
         assert_eq!(
             path,
             LinkPath {
-                segments: vec![LinkPathSegment::Literal("test"), LinkPathSegment::Separator]
+                segments: vec![
+                    LinkPathSegment::Literal("test".to_string()),
+                    LinkPathSegment::Separator
+                ]
             }
         );
     }
@@ -315,6 +319,18 @@ mod test {
         let path = LinkPath::parse("test/%w%");
         assert_eq!(false, path.matches("test").is_match);
         assert_eq!(true, path.matches("test/").is_match);
+        assert_eq!(true, path.matches("test//").is_match);
         assert_eq!(true, path.matches("test/foo").is_match);
+        assert_eq!(true, path.matches("test/foo/bar").is_match);
+        assert_eq!(true, path.matches("test///").is_match);
+        assert_eq!(true, path.matches("test///foo").is_match);
+
+        let path = LinkPath::parse("test/%w%/f");
+        assert_eq!(false, path.matches("test").is_match);
+        assert_eq!(false, path.matches("test/").is_match);
+        assert_eq!(false, path.matches("test//f").is_match);
+        assert_eq!(true, path.matches("test///f").is_match);
+        assert_eq!(true, path.matches("test/foo/f").is_match);
+        assert_eq!(false, path.matches("test/foo/bar/f").is_match);
     }
 }
