@@ -1,20 +1,30 @@
+use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fs::File;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tracing::warn;
+use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let app = Router::new().route("/", get(redirect));
+    let config = Config::load()?;
+    debug!("using configuration {:#?}", config);
+
+    let links = Arc::new(config.links.into_iter().map(Link::from).collect::<Vec<_>>());
+
+    let app = Router::new()
+        .route("/*route", get(redirect))
+        .layer(Extension(links));
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    tracing::debug!("listening on {}", addr);
+    info!("listening on {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await
@@ -25,8 +35,10 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
-    #[error("todo")]
-    Todo,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("invalid configuration")]
+    Config(#[from] serde_yaml::Error),
 }
 
 impl From<Error> for StatusCode {
@@ -37,10 +49,15 @@ impl From<Error> for StatusCode {
     }
 }
 
-async fn redirect() -> Result<Json<Link>, StatusCode> {
-    let route = Link {
-        path: LinkPath::parse("test"),
-    };
+async fn redirect(
+    Path(path): Path<String>,
+    Extension(links): Extension<Arc<Vec<Link>>>,
+) -> Result<Json<Link>, StatusCode> {
+    debug!("path {:?}", path);
+    
+    // TODO make this more efficient. 
+    // store a trie for links starting with literals?
+    let matched_link = links.iter().find(predicate)
 
     Ok(Json(route))
 }
@@ -48,6 +65,29 @@ async fn redirect() -> Result<Json<Link>, StatusCode> {
 #[derive(Debug, Clone, serde::Serialize)]
 struct Link {
     path: LinkPath,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Config {
+    links: Vec<ConfigLink>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ConfigLink(String);
+
+impl From<ConfigLink> for Link {
+    fn from(c: ConfigLink) -> Self {
+        Self {
+            path: LinkPath::parse(&c.0),
+        }
+    }
+}
+
+impl Config {
+    fn load() -> Result<Self, Error> {
+        let file = File::open("config.yaml")?;
+        Ok(serde_yaml::from_reader(file)?)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
