@@ -1,5 +1,6 @@
 use axum::extract::Path;
 use axum::http::StatusCode;
+use axum::response::Redirect;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use std::borrow::{Borrow, Cow};
@@ -52,19 +53,39 @@ impl From<Error> for StatusCode {
 async fn redirect(
     Path(path): Path<String>,
     Extension(links): Extension<Arc<Vec<Link>>>,
-) -> Result<Json<Link>, StatusCode> {
+) -> Result<Redirect, StatusCode> {
     debug!("path {:?}", path);
-    
-    // TODO make this more efficient. 
-    // store a trie for links starting with literals?
-    let matched_link = links.iter().find(predicate)
 
-    Ok(Json(route))
+    let literal_path = LiteralPath::parse(&path[1..]);
+
+    // TODO make this more efficient.
+    // store a trie for links starting with literals?
+    let matched_link = links.iter().find_map(|link| {
+        let result = link.path.matches(&literal_path);
+        if result.is_match {
+            Some((link, result.extract.expect("todo")))
+        } else {
+            None
+        }
+    });
+
+    if let Some((link, extract)) = matched_link {
+        debug!("extracted {:?}", extract);
+        let to = extract
+            .into_iter()
+            .fold(link.to.clone(), |s, (key, value)| {
+                s.replace(&format!("%{}%", key), value)
+            });
+        Ok(Redirect::temporary(&to))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct Link {
     path: LinkPath,
+    to: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -73,19 +94,29 @@ struct Config {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ConfigLink(String);
+struct ConfigLink {
+    from: String,
+    to: String,
+}
 
 impl From<ConfigLink> for Link {
     fn from(c: ConfigLink) -> Self {
         Self {
-            path: LinkPath::parse(&c.0),
+            path: LinkPath::parse(&c.from),
+            to: c.to,
         }
     }
 }
 
 impl Config {
     fn load() -> Result<Self, Error> {
-        let file = File::open("config.yaml")?;
+        let path =
+            std::env::var("WAYPOINT_CONFIG_PATH").unwrap_or_else(|_| "./config.yaml".to_string());
+        debug!("loading configuration at {}", path);
+        let file = File::open(&path).map_err(|e| {
+            warn!("could not load configuration at {}", &path);
+            e
+        })?;
         Ok(serde_yaml::from_reader(file)?)
     }
 }
@@ -175,23 +206,35 @@ impl LinkPath {
             .count()
     }
 
-    fn matches<'b>(&self, path: &'b str) -> SegmentMatchResult<HashMap<String, &'b str>> {
-        let mut literal_path: LiteralPath<'b> = LiteralPath::parse(path);
+    fn matches_str<'a, 'b>(
+        &'a self,
+        path: &'b str,
+    ) -> SegmentMatchResult<HashMap<&'a str, &'b str>> {
+        self.matches(&LiteralPath::parse(path))
+    }
+
+    fn matches<'a, 'b>(
+        &'a self,
+        path: &LiteralPath<'b>,
+    ) -> SegmentMatchResult<HashMap<&'a str, &'b str>> {
         let (matches, extract) = self
             .segments
             .iter()
             .zip(
-                literal_path
-                    .segments
-                    .into_iter()
+                path.segments
+                    .iter()
                     // if the link path is longer, match aganst Empty
-                    .chain(std::iter::repeat(LiteralPathSegment::Empty)),
+                    .chain(std::iter::repeat(&LiteralPathSegment::Empty)),
             )
             .fold((true, HashMap::new()), |(matches, mut extract), (s, p)| {
                 let result = s.matches(p);
                 let matches = if matches { result.is_match } else { matches };
                 if let Some(extract_value) = result.extract {
-                    extract.insert("todo".to_string(), extract_value);
+                    let extract_key = match s {
+                        LinkPathSegment::Wildcard(name) => name.as_ref(),
+                        _ => todo!(),
+                    };
+                    extract.insert(extract_key, extract_value);
                 }
                 (matches, extract)
             });
@@ -223,14 +266,14 @@ impl LinkPathSegment {
         }
     }
 
-    fn matches<'b>(&self, path: LiteralPathSegment<'b>) -> SegmentMatchResult<&'b str> {
+    fn matches<'b>(&self, path: &LiteralPathSegment<'b>) -> SegmentMatchResult<&'b str> {
         match (self, path) {
             (Self::Separator, LiteralPathSegment::Separator) => SegmentMatchResult {
                 is_match: true,
                 extract: None,
             },
             (Self::Literal(value), LiteralPathSegment::Literal(path)) => SegmentMatchResult {
-                is_match: *value == path,
+                is_match: *value == *path,
                 extract: None,
             },
             (Self::Wildcard(name), LiteralPathSegment::Literal(value)) => SegmentMatchResult {
@@ -336,41 +379,41 @@ mod test {
     #[test]
     fn it_matches_paths() {
         let path = LinkPath::parse("test");
-        assert_eq!(true, path.matches("test").is_match);
-        assert_eq!(false, path.matches("testx").is_match);
-        assert_eq!(false, path.matches("testtest").is_match);
+        assert_eq!(true, path.matches_str("test").is_match);
+        assert_eq!(false, path.matches_str("testx").is_match);
+        assert_eq!(false, path.matches_str("testtest").is_match);
 
         let path = LinkPath::parse("test/foo");
-        assert_eq!(true, path.matches("test/foo").is_match);
-        assert_eq!(false, path.matches("testx/foo").is_match);
-        assert_eq!(false, path.matches("test/testx").is_match);
+        assert_eq!(true, path.matches_str("test/foo").is_match);
+        assert_eq!(false, path.matches_str("testx/foo").is_match);
+        assert_eq!(false, path.matches_str("test/testx").is_match);
     }
 
     #[test]
     fn it_matches_separators() {
         let path = LinkPath::parse("/");
-        assert_eq!(true, path.matches("/").is_match);
+        assert_eq!(true, path.matches_str("/").is_match);
         let path = LinkPath::parse("test/");
-        assert_eq!(true, path.matches("test/").is_match);
+        assert_eq!(true, path.matches_str("test/").is_match);
     }
 
     #[test]
     fn it_matches_wildcard_paths() {
         let path = LinkPath::parse("test/%w%");
-        assert_eq!(false, path.matches("test").is_match);
-        assert_eq!(true, path.matches("test/").is_match);
-        assert_eq!(true, path.matches("test//").is_match);
-        assert_eq!(true, path.matches("test/foo").is_match);
-        assert_eq!(true, path.matches("test/foo/bar").is_match);
-        assert_eq!(true, path.matches("test///").is_match);
-        assert_eq!(true, path.matches("test///foo").is_match);
+        assert_eq!(false, path.matches_str("test").is_match);
+        assert_eq!(true, path.matches_str("test/").is_match);
+        assert_eq!(true, path.matches_str("test//").is_match);
+        assert_eq!(true, path.matches_str("test/foo").is_match);
+        assert_eq!(true, path.matches_str("test/foo/bar").is_match);
+        assert_eq!(true, path.matches_str("test///").is_match);
+        assert_eq!(true, path.matches_str("test///foo").is_match);
 
         let path = LinkPath::parse("test/%w%/f");
-        assert_eq!(false, path.matches("test").is_match);
-        assert_eq!(false, path.matches("test/").is_match);
-        assert_eq!(false, path.matches("test//f").is_match);
-        assert_eq!(true, path.matches("test///f").is_match);
-        assert_eq!(true, path.matches("test/foo/f").is_match);
-        assert_eq!(false, path.matches("test/foo/bar/f").is_match);
+        assert_eq!(false, path.matches_str("test").is_match);
+        assert_eq!(false, path.matches_str("test/").is_match);
+        assert_eq!(false, path.matches_str("test//f").is_match);
+        assert_eq!(true, path.matches_str("test///f").is_match);
+        assert_eq!(true, path.matches_str("test/foo/f").is_match);
+        assert_eq!(false, path.matches_str("test/foo/bar/f").is_match);
     }
 }

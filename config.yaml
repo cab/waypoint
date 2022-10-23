@@ -1,2 +1,5 @@
 links:
-  - x
+  - from: google/scout
+    to: https://google.com/search?q=scout%20the%20dog
+  - from: google/%query%
+    to: https://google.com/search?q=%query%
