@@ -1,7 +1,7 @@
 FROM rust:1.64 as builder
 WORKDIR /usr/src/waypoint
 COPY src ./src
-COPY Cargo.toml Cargo.lock .
+COPY Cargo.toml Cargo.lock ./
 RUN cargo install --path .
 
 FROM debian:buster-slim
