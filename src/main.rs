@@ -24,7 +24,12 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/*route", get(redirect))
         .layer(Extension(links));
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+
+    let port = std::env::var("PORT")
+        .map(|s| s.parse().expect("invalid PORT"))
+        .unwrap_or(3000u16);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("listening on {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
