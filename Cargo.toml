@@ -1,0 +1,14 @@
+[package]
+edition = "2021"
+name = "waypoint"
+version = "0.1.0"
+
+[dependencies]
+axum = {version = "^0.5", features = []}
+sqlx = {version = "^0.6", features = ["runtime-tokio-rustls", "sqlite"]}
+tokio = {version = "^1.0", features = ["full"]}
+tracing = "0.1"
+tracing-subscriber = {version = "0.3", features = ["env-filter"]}
+anyhow = "^1.0"
+thiserror = "^1.0"
+serde = { version = "^1.0", features=["derive"]}
